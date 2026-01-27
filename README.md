@@ -1,0 +1,1 @@
+# openvsx-bicep
