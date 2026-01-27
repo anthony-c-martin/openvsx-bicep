@@ -1,0 +1,247 @@
+name: vscode-bicep Automated Build
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
+
+jobs:
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check_commit.outputs.should_build }}
+      latest_tag: ${{ steps.get_upstream.outputs.latest_tag }}
+      latest_sha: ${{ steps.get_upstream.outputs.latest_sha }}
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Checkout upstream bicep
+        uses: actions/checkout@v4
+        with:
+          repository: Azure/bicep
+          path: upstream
+          fetch-depth: 0
+
+      - name: Get latest tag and commit sha from upstream
+        id: get_upstream
+        run: |
+          cd upstream
+          git fetch --tags
+          LATEST_TAG=$(git for-each-ref --sort=-creatordate --format '%(refname:short)' refs/tags | head -n1)
+          echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          LATEST_SHA=$(git rev-list -n 1 "$LATEST_TAG")
+          echo "latest_sha=$LATEST_SHA" >> $GITHUB_OUTPUT
+
+      - name: Checkout latest tag
+        run: |
+          cd upstream
+          git checkout ${{ steps.get_upstream.outputs.latest_tag }}
+
+      - name: Read last built sha
+        id: readsha
+        run: |
+          if [ -f .last_built_sha ]; then
+            LAST_SHA=$(cat .last_built_sha)
+            echo "last_sha=$LAST_SHA" >> $GITHUB_OUTPUT
+          else
+            echo "last_sha=none" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check if new commit exists
+        id: check_commit
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual trigger detected. Forcing build."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          elif [ "${{ steps.get_upstream.outputs.latest_sha }}" = "${{ steps.readsha.outputs.last_sha }}" ]; then
+            echo "No new commit. Skipping build."
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "New commit detected. Proceeding with build."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+
+  build-and-release:
+    needs: check-changes
+    if: needs.check-changes.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Checkout upstream bicep
+        uses: actions/checkout@v4
+        with:
+          repository: Azure/bicep
+          path: upstream
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: upstream/global.json
+
+      - name: Checkout latest tag
+        run: |
+          cd upstream
+          git fetch --tags
+          git checkout ${{ needs.check-changes.outputs.latest_tag }}
+
+      - name: Change publisher in package.json
+        run: |
+          jq '.publisher = "anthony-c-martin"' package.json > package.tmp.json
+          mv package.tmp.json package.json
+        working-directory: upstream/src/vscode-bicep
+
+      - name: Modify README.md
+        run: |
+          cat > README.tmp.md << 'EOF'
+          > **⚠️ CUSTOM BUILD NOTICE**
+          > 
+          > This is a custom build of the official Azure Bicep extension for Visual Studio Code.
+          > 
+          > - **Original Source**: [Azure/bicep](https://github.com/Azure/bicep)
+          > - **Build Repository**: [anthony-c-martin/openvsx-bicep](https://github.com/anthony-c-martin/openvsx-bicep)
+          > - **Publisher**: anthony-c-martin
+          > - **Version**: ${{ needs.check-changes.outputs.latest_tag }}
+          > 
+          > This build is automatically generated and published to OpenVSX for use in VS Code forks that don't have access to the Microsoft marketplace.
+          > 
+          > ---
+          EOF
+
+          cat README.md >> README.tmp.md
+          mv README.tmp.md README.md
+        working-directory: upstream/src/vscode-bicep
+
+      - name: Publish Language Server
+        run: |
+          dotnet publish --configuration release ./src/Bicep.LangServer/Bicep.LangServer.csproj
+          cp -R src/Bicep.LangServer/bin/release/net10.0/publish ./src/vscode-bicep/bicepLanguageServer
+        working-directory: upstream
+
+      - name: Publish MCP Server
+        run: |
+          dotnet publish --configuration release ./src/Bicep.McpServer/Bicep.McpServer.csproj
+          cp -R src/Bicep.McpServer/bin/release/net10.0/publish ./src/vscode-bicep/bicepMcpServer
+        working-directory: upstream
+
+      - name: npm ci (vscode-bicep-ui)
+        run: npm ci
+        working-directory: upstream/src/vscode-bicep-ui
+
+      - name: Build vscode-bicep-ui
+        run: npm run build
+        working-directory: upstream/src/vscode-bicep-ui
+
+      - name: npm ci (vscode-bicep)
+        run: npm ci
+        working-directory: upstream/src/vscode-bicep
+
+      - name: Generate VSIX notice
+        run: |
+          mkdir -p ./src/vscode-bicep-notice/inputs
+          npm --prefix ./src/vscode-bicep list -a --json > ./src/vscode-bicep-notice/inputs/npm-list.json
+          cp ./src/Bicep.LangServer/obj/project.assets.json ./src/vscode-bicep-notice/inputs/langserver.assets.json
+          cp ./src/Bicep.McpServer/obj/project.assets.json ./src/vscode-bicep-notice/inputs/mcpserver.assets.json
+          dotnet build --configuration Release ./src/vscode-bicep-notice/vscode-bicep-notice.proj
+        working-directory: upstream
+
+      - name: Create VSIX
+        run: npm run package
+        working-directory: upstream/src/vscode-bicep
+
+      - name: Upload VSIX
+        uses: actions/upload-artifact@v6
+        with:
+          name: vscode-bicep.vsix
+          path: upstream/src/vscode-bicep/vscode-bicep.vsix
+          if-no-files-found: error
+
+      - name: Delete existing release if exists
+        run: |
+          if gh release view ${{ needs.check-changes.outputs.latest_tag }} > /dev/null 2>&1; then
+            echo "Deleting existing release ${{ needs.check-changes.outputs.latest_tag }}"
+            gh release delete ${{ needs.check-changes.outputs.latest_tag }} --yes
+          else
+            echo "No existing release found for ${{ needs.check-changes.outputs.latest_tag }}"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete existing tag if exists
+        run: |
+          if git rev-parse ${{ needs.check-changes.outputs.latest_tag }} > /dev/null 2>&1; then
+            echo "Deleting existing tag ${{ needs.check-changes.outputs.latest_tag }}"
+            git tag -d ${{ needs.check-changes.outputs.latest_tag }} || true
+            git push origin :refs/tags/${{ needs.check-changes.outputs.latest_tag }} || true
+          else
+            echo "No existing tag found for ${{ needs.check-changes.outputs.latest_tag }}"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub Release
+        run: |
+          gh release create ${{ needs.check-changes.outputs.latest_tag }} \
+            --title "vscode-bicep ${{ needs.check-changes.outputs.latest_tag }}" \
+            --notes "Automated build of vscode-bicep based on upstream tag ${{ needs.check-changes.outputs.latest_tag }}
+
+          Source: https://github.com/Azure/bicep/releases/tag/${{ needs.check-changes.outputs.latest_tag }}" \
+            --latest \
+            upstream/src/vscode-bicep/vscode-bicep.vsix
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install ovsx CLI
+        run: npm install -g ovsx
+
+      - name: Ensure OpenVSX namespace exists (idempotent)
+        run: |
+          ovsx create-namespace anthony-c-martin -p "$OPENVSX_ACCESS_TOKEN" || true
+        env:
+          OPENVSX_ACCESS_TOKEN: ${{ secrets.OPENVSX_ACCESS_TOKEN }}
+
+      - name: Publish to OpenVSX
+        run: |
+            echo "Publishing..."
+            ovsx publish --packagePath "upstream/src/vscode-bicep/vscode-bicep.vsix" --skip-duplicate -p "$OPENVSX_ACCESS_TOKEN"
+        env:
+          OPENVSX_ACCESS_TOKEN: ${{ secrets.OPENVSX_ACCESS_TOKEN }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync to latest main (before making changes)
+        run: |
+          git fetch origin main
+          git rebase origin/main
+
+      - name: Update last built sha file
+        run: |
+          echo "${{ needs.check-changes.outputs.latest_sha }}" > .last_built_sha
+
+      - name: Commit updated sha file
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "actions@github.com"
+          git add .last_built_sha
+          if git diff --staged --quiet; then
+            echo "No changes to .last_built_sha file. Skipping commit."
+          else
+            git commit -m "Update last built sha to ${{ needs.check-changes.outputs.latest_sha }}"
+            git push origin main
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
