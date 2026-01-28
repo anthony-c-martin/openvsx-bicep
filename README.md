@@ -1,6 +1,6 @@
 # openvsx-bicep
 
-[![Open VSX Version](https://img.shields.io/open-vsx/v/anthony-c-martin/bicep)](https://open-vsx.org/extension/anthony-c-martin/bicep)
+[![Open VSX Version](https://img.shields.io/open-vsx/v/anthony-c-martin/vscode-bicep)](https://open-vsx.org/extension/anthony-c-martin/vscode-bicep)
 [![GitHub Release](https://img.shields.io/github/v/release/anthony-c-martin/openvsx-bicep)](https://github.com/anthony-c-martin/openvsx-bicep/releases)
 [![Build and Release](https://github.com/anthony-c-martin/openvsx-bicep/actions/workflows/build-and-release.yml/badge.svg)](https://github.com/anthony-c-martin/openvsx-bicep/actions/workflows/build-and-release.yml)
 
